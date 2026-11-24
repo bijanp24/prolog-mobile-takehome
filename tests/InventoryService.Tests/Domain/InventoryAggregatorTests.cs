@@ -131,4 +131,22 @@ public class InventoryAggregatorTests
         Assert.Equal(2, first.Quantity);
         Assert.Equal(BaseTime, first.LastUpdated);
     }
+
+    [Fact]
+    public void Category_spellings_that_differ_by_case_or_spaces_are_one_category()
+    {
+        // Finding #4: the live API sends "  electronics ", "ELECTRONICS", " Electronics" and so on.
+        var records = new[]
+        {
+            Record(1, "Electronics", 1m, 1),
+            Record(2, "  electronics ", 1m, 1),
+            Record(3, "ELECTRONICS", 1m, 1),
+            Record(4, " home & kitchen", 1m, 1),
+        };
+
+        InventorySummaryResponse result = _aggregator.Aggregate(records);
+
+        Assert.Equal(new[] { "Electronics", "Home & Kitchen" }, result.Categories.Select(c => c.Category));
+        Assert.Equal(3, result.Categories[0].AvailableRecordCount);
+    }
 }

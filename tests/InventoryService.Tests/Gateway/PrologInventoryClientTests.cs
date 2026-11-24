@@ -179,4 +179,96 @@ public class PrologInventoryClientTests
 
         Assert.Contains("Record 1", ex.Message);
     }
+
+    [Theory]
+    [InlineData("price", -1.0, 1)]
+    [InlineData("quantity", 10.0, -1)]
+    public async Task Negative_price_or_quantity_is_a_data_error(string field, decimal price, int quantity)
+    {
+        _fakeApi.RespondWithJson(Page(1, totalPages: 1, totalRecords: 1, pageSize: 2, Record(1, price: price, quantity: quantity)));
+
+        var ex = await Assert.ThrowsAsync<UpstreamDataException>(
+            () => CreateClient().GetAllRecordsAsync(CancellationToken.None));
+
+        Assert.Contains(field, ex.Message);
+    }
+
+    // ---- Completeness and consistency across pages (docs/api-findings.md) ----
+
+    [Fact]
+    public async Task Identical_record_repeated_across_a_page_boundary_is_kept_once()
+    {
+        // Finding #3: the live API repeats the last record of a page at the start of the next one.
+        _fakeApi
+            .RespondWithJson(Page(1, totalPages: 2, totalRecords: 3, pageSize: 2, Record(1), Record(2)))
+            .RespondWithJson(Page(2, totalPages: 2, totalRecords: 3, pageSize: 2, Record(2), Record(3)));
+
+        IReadOnlyList<InventoryRecord> records = await CreateClient().GetAllRecordsAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { 1, 2, 3 }, records.Select(r => r.Id).OrderBy(id => id));
+    }
+
+    [Fact]
+    public async Task Same_id_with_different_data_is_a_data_error()
+    {
+        _fakeApi
+            .RespondWithJson(Page(1, totalPages: 2, totalRecords: 3, pageSize: 2, Record(1), Record(2, quantity: 5)))
+            .RespondWithJson(Page(2, totalPages: 2, totalRecords: 3, pageSize: 2, Record(2, quantity: 9), Record(3)));
+
+        var ex = await Assert.ThrowsAsync<UpstreamDataException>(
+            () => CreateClient().GetAllRecordsAsync(CancellationToken.None));
+
+        Assert.Contains("Record 2", ex.Message);
+    }
+
+    [Fact]
+    public async Task Fewer_unique_records_than_totalRecords_is_a_data_error()
+    {
+        // Every page is a 200, but page 2 is empty: the dataset is incomplete.
+        _fakeApi
+            .RespondWithJson(Page(1, totalPages: 2, totalRecords: 3, pageSize: 2, Record(1), Record(2)))
+            .RespondWithJson(Page(2, totalPages: 2, totalRecords: 3, pageSize: 2));
+
+        var ex = await Assert.ThrowsAsync<UpstreamDataException>(
+            () => CreateClient().GetAllRecordsAsync(CancellationToken.None));
+
+        Assert.Contains("Expected 3 unique records but received 2", ex.Message);
+    }
+
+    [Fact]
+    public async Task Wrong_page_number_in_response_is_a_data_error()
+    {
+        _fakeApi
+            .RespondWithJson(Page(1, totalPages: 2, totalRecords: 3, pageSize: 2, Record(1), Record(2)))
+            .RespondWithJson(Page(1, totalPages: 2, totalRecords: 3, pageSize: 2, Record(1), Record(2))); // asked for page 2
+
+        var ex = await Assert.ThrowsAsync<UpstreamDataException>(
+            () => CreateClient().GetAllRecordsAsync(CancellationToken.None));
+
+        Assert.Contains("Asked for page 2", ex.Message);
+    }
+
+    [Fact]
+    public async Task Totals_changing_between_pages_is_a_data_error()
+    {
+        _fakeApi
+            .RespondWithJson(Page(1, totalPages: 2, totalRecords: 3, pageSize: 2, Record(1), Record(2)))
+            .RespondWithJson(Page(2, totalPages: 2, totalRecords: 4, pageSize: 2, Record(3), Record(4)));
+
+        await Assert.ThrowsAsync<UpstreamDataException>(
+            () => CreateClient().GetAllRecordsAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task TotalPages_that_disagrees_with_totalRecords_is_a_data_error()
+    {
+        // 3 records at 2 per page needs 2 pages, not 1: we would silently miss record 3.
+        _fakeApi.RespondWithJson(Page(1, totalPages: 1, totalRecords: 3, pageSize: 2, Record(1), Record(2)));
+
+        var ex = await Assert.ThrowsAsync<UpstreamDataException>(
+            () => CreateClient().GetAllRecordsAsync(CancellationToken.None));
+
+        Assert.Contains("totalPages=1", ex.Message);
+        Assert.Single(_fakeApi.Requests);
+    }
 }

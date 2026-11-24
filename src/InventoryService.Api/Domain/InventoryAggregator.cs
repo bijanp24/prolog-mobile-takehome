@@ -1,3 +1,4 @@
+using System.Globalization;
 using InventoryService.Api.Domain.Models;
 
 namespace InventoryService.Api.Domain;
@@ -16,9 +17,10 @@ public class InventoryAggregator : IInventoryAggregator
             .ToList();
 
         // Rule 2: one group per category, alphabetical so the output is always in the same order.
-        // A category whose records are all zero-quantity has no group, so it is left out.
+        // Upstream spells categories inconsistently ("  electronics ", "ELECTRONICS"), so we group
+        // on a cleaned-up name. A category whose records are all zero-quantity has no group, so it is left out.
         var groups = availableRecords
-            .GroupBy(record => record.Category)
+            .GroupBy(record => NormalizeCategory(record.Category))
             .OrderBy(group => group.Key, StringComparer.Ordinal);
 
         var categories = new List<CategorySummary>();
@@ -28,6 +30,16 @@ public class InventoryAggregator : IInventoryAggregator
         }
 
         return new InventorySummaryResponse(categories);
+    }
+
+    /// <summary>
+    /// "  home & kitchen " and "HOME & KITCHEN" both become "Home & Kitchen":
+    /// trim the spaces, then title-case so every spelling maps to one name.
+    /// </summary>
+    public static string NormalizeCategory(string category)
+    {
+        string trimmed = category.Trim().ToLowerInvariant();
+        return CultureInfo.InvariantCulture.TextInfo.ToTitleCase(trimmed);
     }
 
     private static CategorySummary BuildCategorySummary(string category, List<InventoryRecord> records)

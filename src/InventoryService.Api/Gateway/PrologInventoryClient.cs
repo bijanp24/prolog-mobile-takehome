@@ -32,27 +32,81 @@ public class PrologInventoryClient : IInventoryGateway
 
     public async Task<IReadOnlyList<InventoryRecord>> GetAllRecordsAsync(CancellationToken cancellationToken)
     {
-        // Page 1 tells us how many pages there are.
+        // Page 1 tells us how many pages and records to expect. Everything after is checked against it.
         RecordsPageDto firstPage = await GetPageAsync(1, cancellationToken);
         int totalPages = firstPage.TotalPages ?? throw new UpstreamDataException("Page 1 did not include totalPages.");
+        int totalRecords = firstPage.TotalRecords ?? throw new UpstreamDataException("Page 1 did not include totalRecords.");
 
-        var rawRecords = new List<RecordDto?>(firstPage.Records!);
+        int expectedPages = (totalRecords + _pageSize - 1) / _pageSize; // ceiling division
+        if (totalPages != expectedPages)
+        {
+            throw new UpstreamDataException(
+                $"Page 1 says totalPages={totalPages}, but {totalRecords} records at {_pageSize} per page needs {expectedPages}.");
+        }
 
-        // Pages are fetched one at a time: simple to follow in logs and in the debugger.
+        // Keyed by id: the live API repeats a record at some page boundaries (docs/api-findings.md #3).
+        var recordsById = new Dictionary<int, InventoryRecord>();
+        AddPageRecords(firstPage, 1, recordsById);
+
+        // Pages are fetched one at a time: simple to follow in logs and in the debugger,
+        // and kinder to the API's rate limit (5 requests per 10 seconds).
         for (int pageNumber = 2; pageNumber <= totalPages; pageNumber++)
         {
             RecordsPageDto page = await GetPageAsync(pageNumber, cancellationToken);
-            rawRecords.AddRange(page.Records!);
+
+            if (page.TotalPages != totalPages || page.TotalRecords != totalRecords)
+            {
+                throw new UpstreamDataException(
+                    $"Page {pageNumber} reports totalPages={page.TotalPages}, totalRecords={page.TotalRecords}, " +
+                    $"but page 1 reported {totalPages} and {totalRecords}. The dataset changed or the API is inconsistent.");
+            }
+
+            AddPageRecords(page, pageNumber, recordsById);
         }
 
-        var records = new List<InventoryRecord>();
-        foreach (RecordDto? rawRecord in rawRecords)
+        // The final completeness check: a 200 on every page does not mean we got everything.
+        if (recordsById.Count != totalRecords)
         {
-            records.Add(ToDomainRecord(rawRecord));
+            throw new UpstreamDataException(
+                $"Expected {totalRecords} unique records but received {recordsById.Count} across {totalPages} pages.");
         }
 
-        _logger.LogInformation("Fetched {RecordCount} records across {PageCount} pages.", records.Count, totalPages);
-        return records;
+        _logger.LogInformation("Fetched {RecordCount} unique records across {PageCount} pages.", recordsById.Count, totalPages);
+        return recordsById.Values.ToList();
+    }
+
+    /// <summary>
+    /// Validates each record on a page and adds it to the collection. A repeated id is fine if the
+    /// data is identical (we keep one copy); a repeated id with different data means we cannot tell
+    /// which is correct, so we fail rather than guess.
+    /// </summary>
+    private void AddPageRecords(RecordsPageDto page, int pageNumber, Dictionary<int, InventoryRecord> recordsById)
+    {
+        int duplicates = 0;
+
+        foreach (RecordDto? rawRecord in page.Records!)
+        {
+            InventoryRecord record = ToDomainRecord(rawRecord, pageNumber);
+
+            if (recordsById.TryGetValue(record.Id, out InventoryRecord? existing))
+            {
+                if (existing != record) // records compare by value, field by field
+                {
+                    throw new UpstreamDataException(
+                        $"Record {record.Id} appears more than once with different data (seen again on page {pageNumber}).");
+                }
+
+                duplicates++;
+                continue;
+            }
+
+            recordsById.Add(record.Id, record);
+        }
+
+        if (duplicates > 0)
+        {
+            _logger.LogInformation("Page {Page}: skipped {Count} duplicate record(s) already seen on an earlier page.", pageNumber, duplicates);
+        }
     }
 
     /// <summary>
@@ -102,6 +156,11 @@ public class PrologInventoryClient : IInventoryGateway
                 throw new UpstreamDataException($"Page {pageNumber} had no records array.");
             }
 
+            if (page.Page != pageNumber)
+            {
+                throw new UpstreamDataException($"Asked for page {pageNumber} but the API returned page {page.Page?.ToString() ?? "(missing)"}.");
+            }
+
             _logger.LogInformation("Page {Page} returned {Count} records.", pageNumber, page.Records.Count);
             return page;
         }
@@ -128,17 +187,20 @@ public class PrologInventoryClient : IInventoryGateway
         return new UpstreamRejectedException(code, $"The Inventory API rejected page {pageNumber} with HTTP {code}.{hint}");
     }
 
-    /// <summary>Converts a raw upstream record into a domain record, rejecting missing or invalid fields.</summary>
-    private static InventoryRecord ToDomainRecord(RecordDto? raw)
+    /// <summary>
+    /// Converts a raw upstream record into a domain record, rejecting missing or invalid fields.
+    /// The category is passed through as-is; cleaning it up is a business rule (see InventoryAggregator).
+    /// </summary>
+    private static InventoryRecord ToDomainRecord(RecordDto? raw, int pageNumber)
     {
         if (raw is null)
         {
-            throw new UpstreamDataException("A page contained a null record.");
+            throw new UpstreamDataException($"Page {pageNumber} contained a null record.");
         }
 
         if (raw.Id is null)
         {
-            throw new UpstreamDataException("A record is missing its id.");
+            throw new UpstreamDataException($"A record on page {pageNumber} is missing its id.");
         }
 
         int id = raw.Id.Value;
@@ -147,6 +209,8 @@ public class PrologInventoryClient : IInventoryGateway
         if (string.IsNullOrWhiteSpace(raw.Category)) throw new UpstreamDataException($"Record {id} has no category.");
         if (raw.Price is null) throw new UpstreamDataException($"Record {id} has no price.");
         if (raw.Quantity is null) throw new UpstreamDataException($"Record {id} has no quantity.");
+        if (raw.Price < 0) throw new UpstreamDataException($"Record {id} has a negative price ({raw.Price}).");
+        if (raw.Quantity < 0) throw new UpstreamDataException($"Record {id} has a negative quantity ({raw.Quantity}).");
 
         if (!DateTimeOffset.TryParse(raw.LastUpdated, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out DateTimeOffset lastUpdated))
         {
