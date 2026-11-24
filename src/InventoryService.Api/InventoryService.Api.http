@@ -1,0 +1,8 @@
+# One-click requests for the VS Code REST Client extension.
+# Start the app first (F5 or `dotnet run --project src/InventoryService.Api`).
+
+@baseUrl = http://localhost:5084
+
+### Aggregated inventory by category
+GET {{baseUrl}}/api/inventory/categories
+Accept: application/json
